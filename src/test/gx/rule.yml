@@ -1,0 +1,6 @@
+expectations:
+  - expectation_type: expect_column_values_to_be_between
+    kwargs:
+      column: "a"
+      min_value: 1
+      max_value: 2

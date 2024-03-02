@@ -1,0 +1,223 @@
+# compose.yml Spec: https://github.com/compose-spec/compose-spec/blob/master/spec.md
+# Run:
+# docker network create -d bridge spark-test
+# export KUDU_QUICKSTART_IP=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 |  awk '{print $2}' | tail -1)
+services:
+## Hadoop #####################################################################
+  namenode:
+    image: apache/hadoop:3.3.6
+    hostname: namenode
+    command: [ "hdfs", "namenode" ]
+    ports:
+      - 8020:8020 # namenode rpc
+      - 9870:9870 # namenode web ui
+    env_file:
+      - ./hadoop/env
+    environment:
+      HADOOP_HOME: /opt/hadoop
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    networks:
+      - spark-test
+    volumes:
+      - hadoop-home:/opt/hadoop
+  datanode:
+    image: apache/hadoop:3.3.6
+    
+    hostname: datanode
+    command: [ "hdfs", "datanode" ]
+    ports:
+      - 9864:9864 # web ui
+      - 9866:9866 # data transfer
+    env_file:
+      - ./hadoop/env
+    environment:
+      HADOOP_HOME: /opt/hadoop
+    networks:
+      - spark-test
+## Impala ######################################################################
+  metastore:
+    image: apache/impala:81d5377c2-impala_quickstart_hms
+    # Give the HMS an explicit hostname to avoid issues with docker-compose-generated
+    # hostnames including underscore, which is rejected by Java's URL parser.
+    hostname: metastore
+    command: [ "hms" ]
+    environment:
+      HADOOP_HOME: /opt/hadoop
+    volumes:
+      - hadoop-home:/opt/hadoop
+      # Volume used to store Apache Derby database.
+      - hive-metastore:/var/lib/hive # /metastore/metastore_db
+      # Warehouse directory. HMS does file operations so needs access to the
+      # shared volume.
+      - hive-metastore:/opt/hive/data/warehouse # /metastore/metastore_db
+      - ./hive/conf:/opt/hive/conf:ro
+    networks:
+      - spark-test
+  statestored:
+    image: apache/impala:81d5377c2-statestored
+    hostname: statestored
+    ports:
+      # Web debug UI
+      - "0.0.0.0:25010:25010"
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1"]
+    volumes:
+      - ./hive/conf:/opt/impala/conf:ro
+    networks:
+      - spark-test
+  catalogd:
+    depends_on:
+      - metastore
+      - statestored
+    image: apache/impala:81d5377c2-catalogd
+    hostname: catalogd
+    ports:
+      # Web debug UI
+      - "0.0.0.0:25020:25020"
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1",
+              "-hms_event_polling_interval_s=1", "-invalidate_tables_timeout_s=999999"]
+    volumes:
+      # Warehouse directory. Catalog does file operations so needs access to the
+      # shared volume.
+      - hive-metastore:/opt/hive/data/warehouse
+      - ./hive/conf:/opt/impala/conf:ro
+    networks:
+      - spark-test
+  impalad:
+    image: apache/impala:81d5377c2-impalad_coord_exec
+    hostname: impalad
+    depends_on:
+      - statestored
+      - catalogd
+    ports:
+      # Beeswax endpoint (deprecated)
+      - "0.0.0.0:21000:21000"
+      # HS2 endpoint
+      - "0.0.0.0:21050:21050"
+      # Web debug UI
+      - "0.0.0.0:25000:25000"
+      # HS2 over HTTP endpoint.
+      - "0.0.0.0:28000:28000"
+    command: [ "-v=1",
+               "-redirect_stdout_stderr=false", "-logtostderr",
+               "-kudu_master_hosts=kudu-master:7051",
+               "-mt_dop_auto_fallback=true",
+               "-default_query_options=mt_dop=4,default_file_format=parquet,default_transactional_type=insert_only",
+               "-mem_limit=4gb"]
+    environment:
+      # Keep the Java heap small to preserve memory for query execution.
+      - JAVA_TOOL_OPTIONS="-Xmx1g"
+    volumes:
+      - hive-metastore:/opt/hive/data/warehouse
+      - ./hive/conf:/opt/impala/conf:ro
+    networks:
+      - spark-test
+  dataloader:
+    image: apache/impala:81d5377c2-impala_quickstart_client
+    hostname: dataloader
+    depends_on:
+      impalad:
+        condition: service_started
+    environment:
+      IMPALAD: impalad:21050
+      INIT_SQL: /opt/impala/custom/init.sql
+    entrypoint: /opt/impala/custom/client/entrypoint.sh
+    command: ["init_data"]
+    volumes:
+      - hive-metastore:/user/hive/warehouse
+      - ./hive/conf:/opt/impala/conf:ro
+      - ./impala:/opt/impala/custom:ro
+    networks:
+      - spark-test
+
+## Kudu #######################################################################
+  kudu-master:
+    image: apache/kudu:1.17.0-ubuntu
+    platform: linux/amd64
+    hostname: kudu-master
+    ports:
+      - 7051:7051
+      - 8051:8051
+    command: [ "master" ]
+    environment:
+      - KUDU_MASTERS=kudu-master:7051
+      - >
+        MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+        --rpc_bind_addresses=0.0.0.0:7051
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:7051
+        --webserver_port=8051
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:8051
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+    networks:
+      - spark-test
+  kudu-tserver:
+    image: apache/kudu:1.17.0-ubuntu
+    platform: linux/amd64
+    hostname: kudu-tserver
+    depends_on:
+      - kudu-master
+    ports:
+      - 7050:7050
+      - 8050:8050
+    command: [ "tserver" ]
+    environment:
+      - KUDU_MASTERS=kudu-master:7051
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7050
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:7050
+        --webserver_port=8050
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:8050
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+    networks:
+      - spark-test
+
+  hue-postgres:
+    image: postgres:16.1-alpine3.19
+    hostname: hue-postgres
+    environment:
+      POSTGRES_USER: hue
+      POSTGRES_PASSWORD: hue
+      POSTGRES_DB: hue
+    networks:
+      - spark-test
+  hue:
+    image: gethue/hue:20240125-140101
+    hostname: hue
+    depends_on:
+      - hue-postgres
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    ports:
+      - 8888:8888
+    volumes:
+      - ./hue/conf/z-hue.ini:/usr/share/hue/desktop/conf/z-hue.ini
+    command:
+      - sh
+      - -c
+      - |
+        /usr/share/hue/build/env/bin/hue makemigrations
+        /usr/share/hue/build/env/bin/hue migrate
+        /usr/share/hue/startup.sh
+    networks:
+      - spark-test
+
+volumes:
+  hadoop-home:
+  hive-metastore:
+
+networks:
+  spark-test:
+    external: true
+
+# docker network create -d bridge spark-test
+# export KUDU_QUICKSTART_IP=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 |  awk '{print $2}' | tail -1)

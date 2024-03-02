@@ -1,0 +1,388 @@
+version: "3"
+
+services:
+  jobmanager:
+    container_name: jobmanager
+    image: flink:1.18.0
+    volumes:
+      - "./base_files/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml"
+      - "./base_files/hive-site.xml:/opt/flink/conf/hive-site.xml"
+      - "../src:/opt/flink/src:z"
+      - "../main:/opt/flink/main:z"
+      - "./lib:/opt/flink/lib:z"
+      - "../jobmanager_log:/opt/flink/log:z"
+    hostname: "jobmanager"
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+      - "6124:6124"
+    expose:
+      - "6123"
+      - "9250"
+    command: jobmanager
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+    networks:
+      - ff-network
+
+  taskmanager:
+    container_name: taskmanager
+    image: flink:1.18.0
+    volumes:
+      - "./base_files/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml"
+      - "../src:/opt/flink/src:z"
+      - "../main:/opt/flink/main:z"
+      - "./base_files/hive-site.xml:/opt/flink/conf/hive-site.xml"
+      - "../taskmanager_log:/opt/flink/log:z"
+      - "./lib:/opt/flink/lib:z"
+    ports:
+      - "9251:9251"
+    expose:
+      - "6121"
+      - "6122"
+      - "6123"
+      - "9250"
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    links:
+      - jobmanager:jobmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=20
+    networks:
+      - ff-network      
+
+  zookeeper:
+    image: wurstmeister/zookeeper:3.4.6
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks:
+      - ff-network
+  kafka:
+    image: wurstmeister/kafka:2.12-2.2.1
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://kafka:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    networks:
+      - ff-network      
+  kafka-ui:
+    image: provectuslabs/kafka-ui
+    container_name: dachery-kafka-ui
+    hostname: kafka-ui
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dachery-kafka
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    depends_on:
+      - kafka
+    networks:
+      - ff-network
+
+  prometheus:
+    image: prom/prometheus:v2.16.0
+    container_name: prometheus
+    links:
+      - jobmanager:jobmanager
+      - taskmanager:taskmanager
+    command:
+      - '--web.listen-address=0.0.0.0:9099'
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./data/prometheus:/etc/prometheus
+      - ./data/prometheus/data:/prometheus
+    extra_hosts:
+      - host.docker.internal:host-gateway 
+    ports:
+      - 9099:9099
+    networks:
+      - ff-network
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:6.6.2
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./data/grafana/data:/var/lib/grafana
+      - ./data/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - 9900:3000
+    depends_on:
+      - prometheus
+    extra_hosts:
+      - host.docker.internal:host-gateway 
+    networks:
+      - ff-network
+
+
+# # compose.yml Spec: https://github.com/compose-spec/compose-spec/blob/master/spec.md
+# # Run:
+# # docker network create -d bridge ff-network
+# # export KUDU_QUICKSTART_IP=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 |  awk '{print $2}' | tail -1)
+# services:
+## Hadoop #####################################################################
+  namenode:
+    image: apache/hadoop:3.3.6
+    hostname: namenode
+    command: [ "hdfs", "namenode" ]
+    ports:
+      - 8020:8020 # namenode rpc
+      - 9870:9870 # namenode web ui
+    env_file:
+      - ./docker-impala/hadoop/env
+    environment:
+      HADOOP_HOME: /opt/hadoop
+      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+    networks:
+      - ff-network
+    volumes:
+      - hadoop-home:/opt/hadoop
+  datanode:
+    image: apache/hadoop:3.3.6
+    
+    hostname: datanode
+    command: [ "hdfs", "datanode" ]
+    ports:
+      - 9864:9864 # web ui
+      - 9866:9866 # data transfer
+    env_file:
+      - ./docker-impala/hadoop/env
+    environment:
+      HADOOP_HOME: /opt/hadoop
+    networks:
+      - ff-network
+## Impala ######################################################################
+  metastore:
+    image: apache/impala:81d5377c2-impala_quickstart_hms
+    # Give the HMS an explicit hostname to avoid issues with docker-compose-generated
+    # hostnames including underscore, which is rejected by Java's URL parser.
+    hostname: metastore
+    command: [ "hms" ]
+    environment:
+      HADOOP_HOME: /opt/hadoop
+    volumes:
+      - hadoop-home:/opt/hadoop
+      # Volume used to store Apache Derby database.
+      - hive-metastore:/var/lib/hive # /metastore/metastore_db
+      # Warehouse directory. HMS does file operations so needs access to the
+      # shared volume.
+      - hive-metastore:/opt/hive/data/warehouse # /metastore/metastore_db
+      - ./docker-impala/hive/conf:/opt/hive/conf:ro
+    networks:
+      - ff-network
+  statestored:
+    image: apache/impala:81d5377c2-statestored
+    hostname: statestored
+    ports:
+      # Web debug UI
+      - "0.0.0.0:25010:25010"
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1"]
+    volumes:
+      - ./docker-impala/hive/conf:/opt/impala/conf:ro
+    networks:
+      - ff-network
+  catalogd:
+    depends_on:
+      - metastore
+      - statestored
+    image: apache/impala:81d5377c2-catalogd
+    hostname: catalogd
+    ports:
+      # Web debug UI
+      - "0.0.0.0:25020:25020"
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1",
+              "-hms_event_polling_interval_s=1", "-invalidate_tables_timeout_s=999999"]
+    volumes:
+      # Warehouse directory. Catalog does file operations so needs access to the
+      # shared volume.
+      - hive-metastore:/opt/hive/data/warehouse
+      - ./docker-impala/hive/conf:/opt/impala/conf:ro
+    networks:
+      - ff-network
+  impalad:
+    image: apache/impala:81d5377c2-impalad_coord_exec
+    hostname: impalad
+    depends_on:
+      - statestored
+      - catalogd
+    ports:
+      # Beeswax endpoint (deprecated)
+      - "0.0.0.0:21000:21000"
+      # HS2 endpoint
+      - "0.0.0.0:21050:21050"
+      # Web debug UI
+      - "0.0.0.0:25000:25000"
+      # HS2 over HTTP endpoint.
+      - "0.0.0.0:28000:28000"
+    command: [ "-v=1",
+               "-redirect_stdout_stderr=false", "-logtostderr",
+               "-kudu_master_hosts=kudu-master:7051",
+               "-mt_dop_auto_fallback=true",
+               "-default_query_options=mt_dop=4,default_file_format=parquet,default_transactional_type=insert_only",
+               "-mem_limit=4gb"]
+    environment:
+      # Keep the Java heap small to preserve memory for query execution.
+      - JAVA_TOOL_OPTIONS="-Xmx1g"
+    volumes:
+      - hive-metastore:/opt/hive/data/warehouse
+      - ./docker-impala/hive/conf:/opt/impala/conf:ro
+    networks:
+      - ff-network
+  dataloader:
+    image: apache/impala:81d5377c2-impala_quickstart_client
+    hostname: dataloader
+    depends_on:
+      impalad:
+        condition: service_started
+    environment:
+      IMPALAD: impalad:21050
+      INIT_SQL: /opt/impala/custom/init.sql
+    entrypoint: /opt/impala/custom/client/entrypoint.sh
+    command: ["init_data"]
+    volumes:
+      - hive-metastore:/user/hive/warehouse
+      - ./docker-impala/hive/conf:/opt/impala/conf:ro
+      - ./docker-impala/impala:/opt/impala/custom:ro
+    networks:
+      - ff-network
+
+## Kudu #######################################################################
+  # kudu-master:
+  #   image: apache/kudu:1.17.0-ubuntu
+  #   platform: linux/amd64
+  #   hostname: kudu-master
+  #   ports:
+  #     - 7051:7051
+  #     - 8051:8051
+  #   command: [ "master" ]
+  #   environment:
+  #     - KUDU_MASTERS=kudu-master:7051
+  #     - >
+  #       MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+  #       --rpc_bind_addresses=0.0.0.0:7051
+  #       --rpc_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:7051
+  #       --webserver_port=8051
+  #       --webserver_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:8051
+  #       --webserver_doc_root=/opt/kudu/www
+  #       --stderrthreshold=0
+  #       --use_hybrid_clock=false
+  #       --unlock_unsafe_flags=true
+  #   networks:
+  #     - ff-network
+  # kudu-tserver:
+  #   image: apache/kudu:1.17.0-ubuntu
+  #   platform: linux/amd64
+  #   hostname: kudu-tserver
+  #   depends_on:
+  #     - kudu-master
+  #   ports:
+  #     - 7050:7050
+  #     - 8050:8050
+  #   command: [ "tserver" ]
+  #   environment:
+  #     - KUDU_MASTERS=kudu-master:7051
+  #     - >
+  #       TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+  #       --rpc_bind_addresses=0.0.0.0:7050
+  #       --rpc_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:7050
+  #       --webserver_port=8050
+  #       --webserver_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:8050
+  #       --webserver_doc_root=/opt/kudu/www
+  #       --stderrthreshold=0
+  #       --use_hybrid_clock=false
+  #       --unlock_unsafe_flags=true
+  #   networks:
+  #     - ff-network
+
+  hue-postgres:
+    image: postgres:16.1-alpine3.19
+    hostname: hue-postgres
+    environment:
+      POSTGRES_USER: hue
+      POSTGRES_PASSWORD: hue
+      POSTGRES_DB: hue
+    networks:
+      - ff-network
+  hue:
+    image: gethue/hue:20240125-140101
+    hostname: hue
+    depends_on:
+      - hue-postgres
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    ports:
+      - 8888:8888
+    volumes:
+      - ./docker-impala/hue/conf/z-hue.ini:/usr/share/hue/desktop/conf/z-hue.ini
+    command:
+      - sh
+      - -c
+      - |
+        /usr/share/hue/build/env/bin/hue makemigrations
+        /usr/share/hue/build/env/bin/hue migrate
+        /usr/share/hue/startup.sh
+    networks:
+      - ff-network
+
+  redis_container:
+    # 사용할 이미지
+    image: redis:latest
+    # 컨테이너명
+    container_name: redis
+    # 접근 포트 설정(컨테이너 외부:컨테이너 내부)
+    ports:
+      - 6379:6379
+    # 스토리지 마운트(볼륨) 설정
+    volumes:
+      - ./redis/data:/data
+      - ./redis/conf/redis.conf:/usr/local/conf/redis.conf:ro
+    # 컨테이너에 docker label을 이용해서 메타데이터 추가
+    labels:
+      - "name=redis"
+      - "mode=standalone"
+    # 컨테이너 종료시 재시작 여부 설정
+    restart: always
+    command: redis-server /usr/local/conf/redis.conf
+    networks:
+      - ff-network
+
+volumes:
+  hadoop-home:
+  hive-metastore:
+
+# docker network create -d bridge ff-network
+# export KUDU_QUICKSTART_IP=$(ifconfig | grep "inet " | grep -Fv 127.0.0.1 |  awk '{print $2}' | tail -1)
+
+
+networks:
+  ff-network:
+    external: true

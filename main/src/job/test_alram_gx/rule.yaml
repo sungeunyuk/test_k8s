@@ -1,0 +1,11 @@
+expectations:
+  - expectation_type: expect_column_values_to_be_between
+    kwargs:
+      column: "quote_av"
+      min_value: 699
+      max_value: 750
+  - expectation_type: expect_column_values_to_be_between
+    kwargs:
+      column: "Open"
+      min_value: 699
+      max_value: 750

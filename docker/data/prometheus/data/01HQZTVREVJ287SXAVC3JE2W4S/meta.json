@@ -1,0 +1,17 @@
+{
+	"ulid": "01HQZTVREVJ287SXAVC3JE2W4S",
+	"minTime": 1709380800000,
+	"maxTime": 1709388000000,
+	"stats": {
+		"numSamples": 264407,
+		"numSeries": 2379,
+		"numChunks": 3500
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01HQZTVREVJ287SXAVC3JE2W4S"
+		]
+	},
+	"version": 1
+}
